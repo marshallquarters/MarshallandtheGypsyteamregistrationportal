@@ -1,0 +1,661 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MARSHALL & THE GYPSIES ENTERTAINMENT</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module">
+        // --- Firebase Imports ---
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, onSnapshot, collection, addDoc, serverTimestamp, updateDoc, deleteDoc, arrayUnion, arrayRemove } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        
+        // --- GLOBAL SETUP & CONSTANTS ---
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let app, db, auth;
+        let userId = null;
+        let isAuthReady = false;
+        let marshallUid = null; // Will hold Marshall's UID after successful auth
+        let galleryImages = []; // State for gallery images
+        let availableLevel1Roles = {}; // State for available slots
+
+        // Initial Role Definitions
+        const LEVEL_1_ROLES = {
+            'Operations Manager': 1, 'Assistant Operations Manager': 1, 'Team Lead/Coordinator': 1,
+            'General Accountant/Welfare': 1, 'Venue and Facility': 1, 'Stage Manager': 1,
+            'Head of Media': 1, 'Content Director': 1, 'Logistics & Procurement': 1,
+            'PR Manager': 1, 'Head Of Vendors': 1, 'Head Of Hostess': 1,
+            'Head Of Security & Protocol': 1, 'Bar Manager': 1, 'Publicity Manager': 1,
+            'Head Of Volunteers': 1, 'Graphics Designers': 5 
+        };
+
+        const ROLE_SUMMARIES = {
+            'Operations Manager': 'Oversees daily team functions, ensures smooth execution of all logistical plans, and manages cross-departmental coordination.',
+            'Assistant Operations Manager': 'Supports the Operations Manager, focusing on scheduling, resource allocation, and troubleshooting on-site issues.',
+            'Team Lead/Coordinator': 'Manages a specific team segment (e.g., volunteers or promotions), ensuring tasks are completed efficiently and reporting status to management.',
+            'General Accountant/Welfare': 'Handles team finances, manages welfare funds, processes reimbursements, and maintains budget records.',
+            'Venue and Facility': 'Liaises with venue management, handles facility setup and breakdown, and manages all physical assets required for the event.',
+            'Stage Manager': 'Manages the flow of artists, DJs, and hypemen on and off the stage, coordinating with the sound and media teams.',
+            'Head of Media': 'Oversees all media output, including photography, videography, and post-production content.',
+            'Content Director': 'Develops the creative narrative for all marketing campaigns and directs the flow and style of social media content.',
+            'Logistics & Procurement': 'Responsible for sourcing and transporting all necessary materials, equipment, and supplies for the event.',
+            'PR Manager': 'Handles external communications, manages press relations, and ensures positive public perception of the brand.',
+            'Head Of Vendors': 'Manages relationships with external food, beverage, and service vendors, ensuring compliance and quality.',
+            'Head Of Hostess': 'Trains and manages the hostess team, focusing on VVIP service, table assignments, and guest satisfaction.',
+            'Head Of Security & Protocol': 'Manges security personnel, handles all guest protocol (including VIP entry), and ensures a safe environment.',
+            'Bar Manager': 'Coordinates with club staff on inventory management, specialized Hennessy menu execution, and transparent sales tracking.',
+            'Publicity Manager': 'Drives ground and digital promotional efforts, manages marketing materials distribution, and hype generation.',
+            'Head Of Volunteers': 'Recruits, trains, schedules, and manages the large volunteer pool for event support.',
+            'Graphics Designers': 'Responsible for creating all digital and print assets, including flyers, posters, screen visuals, and social media graphics.',
+            'GYPSY NIGHT TEAM LEVEL 2': 'General team member supporting various departments. Focus on learning, high commitment, availability, and accountability to the entertainment team.'
+        };
+        
+        // --- FIREBASE INITIALIZATION ---
+        try {
+            if (Object.keys(firebaseConfig).length > 0) {
+                app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                
+                // Firestore paths (needs 'db' to be defined)
+                const applicationsCollectionPath = `/artifacts/${appId}/public/data/applications`;
+                const positionsDocRef = doc(db, `/artifacts/${appId}/public/data/positions/current_slots`);
+                const galleryDocRef = doc(db, `/artifacts/${appId}/public/data/gallery/images`); 
+
+                // 1. Attempt to sign in with custom token (Marshall)
+                if (initialAuthToken) {
+                    signInWithCustomToken(auth, initialAuthToken)
+                        .then((userCredential) => {
+                            marshallUid = userCredential.user.uid;
+                        })
+                        .catch(error => {
+                            console.error("Custom token sign-in failed, proceeding with anonymous:", error);
+                            signInAnonymously(auth);
+                        });
+                } else {
+                    // 2. Fallback to anonymous sign-in (Applicant)
+                    signInAnonymously(auth);
+                }
+
+                // 3. Auth State Listener
+                onAuthStateChanged(auth, (user) => {
+                    if (user) {
+                        userId = user.uid;
+                        isAuthReady = true;
+                        if (!marshallUid) marshallUid = userId;
+                        
+                        // Pass refs to startDataListeners for scope access
+                        startDataListeners(applicationsCollectionPath, positionsDocRef, galleryDocRef);
+                        updateMarshallViewVisibility();
+                    } else {
+                        isAuthReady = true;
+                    }
+                });
+            } else {
+                console.error("Firebase config is missing. Data persistence disabled.");
+            }
+        } catch (error) {
+            console.error("Firebase setup failed:", error);
+        }
+
+        // Utility to show message box
+        function showMessage(message, type = 'success') {
+            const box = document.getElementById('messageBox');
+            if (box) {
+                box.textContent = message;
+                box.className = 'mt-4 p-4 rounded-lg text-sm';
+                box.classList.remove('hidden', 'bg-red-100', 'text-red-800', 'bg-green-100', 'text-green-800', 'bg-blue-100', 'text-blue-800');
+                
+                if (type === 'success') {
+                    box.classList.add('bg-green-100', 'text-green-800');
+                } else if (type === 'error') {
+                    box.classList.add('bg-red-100', 'text-red-800');
+                } else if (type === 'info') {
+                    box.classList.add('bg-blue-100', 'text-blue-800');
+                }
+                setTimeout(() => box.classList.add('hidden'), 5000); 
+            }
+        }
+        
+        // Function to control Marshall View visibility based on UID
+        function updateMarshallViewVisibility() {
+            const marshallView = document.getElementById('marshallView');
+            const currentUserDisplay = document.getElementById('currentUserUID');
+            if (marshallView && currentUserDisplay && userId === marshallUid) {
+                marshallView.classList.remove('hidden');
+                currentUserDisplay.textContent = `Current User ID (Marshall): ${userId}`;
+            } else if (currentUserDisplay && userId) {
+                 currentUserDisplay.textContent = `Current User ID (Applicant): ${userId}`;
+            }
+        }
+
+        // --- FIREBASE LISTENERS ---
+        // Accepts doc/collection refs now
+        function startDataListeners(applicationsCollectionPath, positionsDocRef, galleryDocRef) {
+            
+            // 1. Listen for Role Availability (Public Read)
+            // Removed getDoc call - relies solely on onSnapshot now for initialization/updates.
+            onSnapshot(positionsDocRef, (docSnap) => {
+                if (docSnap.exists()) {
+                    availableLevel1Roles = docSnap.data().roles || LEVEL_1_ROLES;
+                } else if (userId === marshallUid) {
+                    // Initialize document if missing, only if Marshall is authenticated
+                    availableLevel1Roles = LEVEL_1_ROLES;
+                    setDoc(positionsDocRef, { roles: LEVEL_1_ROLES, lastUpdated: serverTimestamp() });
+                }
+                updateRoleOptions(); 
+                updateRoleSummaryDisplay();
+            }, (error) => {
+                console.error("Error listening to positions:", error);
+            });
+
+            // 2. Listen for Applications (Marshall's View)
+            const applicationsRef = collection(db, applicationsCollectionPath);
+            onSnapshot(applicationsRef, (snapshot) => {
+                const applications = [];
+                snapshot.forEach(doc => {
+                    applications.push({ id: doc.id, ...doc.data() });
+                });
+                renderMarshallDatabase(applications);
+            }, (error) => {
+                console.error("Error listening to applications:", error);
+            });
+            
+            // 3. Listen for Gallery Images (Public Read)
+            onSnapshot(galleryDocRef, (docSnap) => {
+                if (docSnap.exists()) {
+                    galleryImages = (docSnap.data().images || []).filter(url => typeof url === 'string' && url.match(/^(http|https):\/\/[^ "]+$/));
+                } else if (userId === marshallUid) {
+                    // Initialize document if missing, only if Marshall is authenticated
+                    galleryImages = [];
+                    setDoc(galleryDocRef, { images: [] });
+                }
+                renderGalleryForAspirant();
+                if (userId === marshallUid) {
+                    renderMarshallGalleryManagement();
+                }
+            }, (error) => {
+                console.error("Error listening to gallery images:", error);
+            });
+        }
+        
+        // --- UI/FORM LOGIC ---
+        function updateRoleOptions() {
+            const experienceSelect = document.getElementById('experience');
+            const roleContainer = document.getElementById('roleContainer');
+            
+            if (!experienceSelect || !roleContainer) return;
+            
+            const experience = experienceSelect.value;
+            roleContainer.innerHTML = '';
+            
+            if (experience === '0-1') {
+                roleContainer.innerHTML = `
+                    <label for="role" class="block text-sm font-medium text-gray-700 mb-1">Position Applying For</label>
+                    <select id="role" name="role" required class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-lg shadow-sm focus:ring-purple-500 focus:border-purple-500 transition duration-150">
+                        <option value="GYPSY NIGHT TEAM LEVEL 2">GYPSY NIGHT TEAM LEVEL 2</option>
+                    </select>
+                `;
+            } else if (experience === '2+') {
+                let options = `<option value="">-- Select Position --</option>`;
+                options += `<option value="GYPSY NIGHT TEAM LEVEL 2">GYPSY NIGHT TEAM LEVEL 2</option>`;
+
+                Object.entries(availableLevel1Roles).forEach(([roleName, capacity]) => {
+                    if (capacity > 0) {
+                        const level = (capacity === 1 && roleName !== 'Graphics Designers') ? 'LEVEL 1 (Single Slot)' : 'LEVEL 1';
+                        options += `<option value="${roleName}">MARSHALL AND THE GYPSIES ENTERTAINMENT ${level}: ${roleName} (${capacity} slots)</option>`;
+                    }
+                });
+
+                roleContainer.innerHTML = `
+                    <label for="role" class="block text-sm font-medium text-gray-700 mb-1">Position Applying For</label>
+                    <select id="role" name="role" required class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-lg shadow-sm focus:ring-purple-500 focus:border-purple-500 transition duration-150">
+                        ${options}
+                    </select>
+                    <p id="roleSummaryText" class="text-xs text-purple-600 mt-1 italic"></p>
+                `;
+                document.getElementById('role')?.addEventListener('change', updateRoleSummaryDisplay);
+            }
+        }
+
+        function updateRoleSummaryDisplay() {
+            const roleName = document.getElementById('role')?.value;
+            const summaryTextElement = document.getElementById('roleSummaryText');
+            if (summaryTextElement) {
+                summaryTextElement.textContent = ROLE_SUMMARIES[roleName] || '';
+            }
+        }
+
+        // --- ADMINISTRATIVE ACTIONS (Requires Marshall Permissions) ---
+        
+        async function addGalleryImage() {
+            const urlInput = document.getElementById('newImageUrl');
+            const url = urlInput.value.trim();
+
+            if (!url || !url.match(/^(http|https):\/\/[^ "]+$/)) {
+                showMessage("Please enter a valid image URL (starting with http/https).", 'error');
+                return;
+            }
+            if (userId !== marshallUid) {
+                showMessage("Permission denied. Only Marshall can add gallery images.", 'error');
+                return;
+            }
+            try {
+                // Accessing refs defined globally after initialization
+                const galleryDocRef = doc(db, `/artifacts/${appId}/public/data/gallery/images`);
+                if (galleryImages.includes(url)) { showMessage("This image URL is already in the gallery.", 'info'); return; }
+
+                await updateDoc(galleryDocRef, { images: arrayUnion(url) });
+                showMessage("Image URL added to gallery successfully!", 'success');
+                urlInput.value = '';
+            } catch (e) {
+                console.error("Error adding image URL:", e);
+                showMessage("Error adding image URL. Check console for details.", 'error');
+            }
+        }
+        window.addGalleryImage = addGalleryImage;
+
+        async function removeGalleryImage(url) {
+            if (userId !== marshallUid) { showMessage("Permission denied.", 'error'); return; }
+            const galleryDocRef = doc(db, `/artifacts/${appId}/public/data/gallery/images`);
+            const confirmAction = async () => {
+                 try {
+                    await updateDoc(galleryDocRef, { images: arrayRemove(url) });
+                    showMessage("Image removed from gallery.", 'success');
+                } catch (e) {
+                    console.error("Error removing image URL:", e);
+                    showMessage("Error removing image URL.", 'error');
+                }
+            }
+            showConfirmationModal("Remove Image", "Are you sure you want to remove this image from the public gallery?", confirmAction);
+        }
+        window.removeGalleryImage = removeGalleryImage;
+
+        async function acceptApplication(id, roleName) {
+            if (userId !== marshallUid) { showMessage("Permission denied.", 'error'); return; }
+            const applicationsCollectionPath = `/artifacts/${appId}/public/data/applications`;
+            const confirmAction = async () => {
+                try {
+                    await deleteDoc(doc(db, applicationsCollectionPath, id));
+                    showMessage(`Application for ${roleName} accepted and removed from queue.`, 'success');
+                } catch (e) {
+                    console.error("Error accepting application:", e);
+                    showMessage("Error accepting application.", 'error');
+                }
+            };
+            showConfirmationModal("Accept Application", `Are you sure you want to ACCEPT and CLEAR the application for ${roleName}?`, confirmAction);
+        }
+        window.acceptApplication = acceptApplication;
+
+        async function deleteApplication(id, roleName) {
+            if (userId !== marshallUid) { showMessage("Permission denied.", 'error'); return; }
+            const applicationsCollectionPath = `/artifacts/${appId}/public/data/applications`;
+            const deleteAction = async () => {
+                try {
+                    await deleteDoc(doc(db, applicationsCollectionPath, id));
+                    showMessage(`Application for ${roleName} permanently deleted.`, 'success');
+                } catch (e) {
+                    console.error("Error deleting application:", e);
+                    showMessage("Error deleting application.", 'error');
+                }
+            };
+            showConfirmationModal("Delete Application", `Are you sure you want to permanently DELETE the application for ${roleName}? This cannot be undone.`, deleteAction);
+        }
+        window.deleteApplication = deleteApplication;
+
+        // --- CUSTOM CONFIRMATION MODAL LOGIC (Replaces browser alerts) ---
+        let confirmationCallback = null;
+
+        function showConfirmationModal(title, message, callback) {
+            const modal = document.getElementById('customModal');
+            const modalTitle = document.getElementById('modalTitle');
+            const modalMessage = document.getElementById('modalMessage');
+
+            if (modal && modalTitle && modalMessage) {
+                modalTitle.textContent = title;
+                modalMessage.textContent = message;
+                confirmationCallback = callback;
+                modal.classList.remove('hidden');
+            }
+        }
+
+        function hideConfirmationModal() {
+            const modal = document.getElementById('customModal');
+            if (modal) {
+                modal.classList.add('hidden');
+                confirmationCallback = null;
+            }
+        }
+        
+        // --- INITIALIZATION AND EVENT LISTENERS ---
+        document.addEventListener('DOMContentLoaded', () => {
+            const experienceSelect = document.getElementById('experience');
+            if (experienceSelect) {
+                experienceSelect.addEventListener('change', updateRoleOptions);
+                updateRoleOptions();
+            }
+
+            document.getElementById('recruitmentForm')?.addEventListener('submit', async function(event) {
+                event.preventDefault();
+
+                if (!isAuthReady) {
+                    showMessage("Authentication is not ready. Please wait a moment and try again.", 'info');
+                    return;
+                }
+                
+                const form = event.target;
+                const roleName = form.role.value;
+                const experience = form.experience.value;
+                
+                // Safety check before submission
+                if (experience === '2+' && roleName !== 'GYPSY NIGHT TEAM LEVEL 2' && availableLevel1Roles[roleName] <= 0) {
+                    showMessage(`The position for ${roleName} is no longer available. Please select another role.`, 'error');
+                    return;
+                }
+                
+                // Accessing refs here for use inside the async function
+                const applicationsCollectionPath = `/artifacts/${appId}/public/data/applications`;
+                const positionsDocRef = doc(db, `/artifacts/${appId}/public/data/positions/current_slots`);
+
+                const applicationData = {
+                    name: form.name.value,
+                    experience: experience,
+                    role: roleName,
+                    location: {
+                        houseNumber: form.houseNumber.value, street: form.street.value, city: form.city.value, 
+                        state: form.state.value, country: form.country.value,
+                    },
+                    occupation: form.occupation.value,
+                    commitmentAgreed: form.commitment.checked,
+                    appliedAt: serverTimestamp(),
+                    status: 'Pending Review',
+                    appliedByUid: userId 
+                };
+
+                try {
+                    // 1. Submit application (Public CREATE)
+                    await addDoc(collection(db, applicationsCollectionPath), applicationData);
+                    
+                    if (experience === '2+' && roleName !== 'GYPSY NIGHT TEAM LEVEL 2') {
+                        // 2. Decrement slot count (Marshall WRITE)
+                        const newCapacity = availableLevel1Roles[roleName] - 1;
+                        const newRoles = { ...availableLevel1Roles, [roleName]: newCapacity };
+                        await updateDoc(positionsDocRef, { roles: newRoles });
+                    }
+                    
+                    showMessage(`Success! Your application for ${roleName} has been submitted.`, 'success');
+                    form.reset();
+                    updateRoleOptions();
+                    
+                } catch (e) {
+                    console.error("Submission Error:", e);
+                    showMessage("An error occurred during submission. Please try again or check console for details.", 'error');
+                }
+            });
+
+            // Modal Listeners
+            document.getElementById('modalCancel')?.addEventListener('click', hideConfirmationModal);
+            document.getElementById('modalConfirm')?.addEventListener('click', () => {
+                if (confirmationCallback) {
+                    confirmationCallback();
+                }
+                hideConfirmationModal();
+            });
+
+            document.getElementById('addImageUrlButton')?.addEventListener('click', (e) => {
+                e.preventDefault();
+                window.addGalleryImage();
+            });
+        });
+        
+        // --- RENDER FUNCTIONS ---
+
+        function renderGalleryForAspirant() {
+            const galleryContainer = document.getElementById('aspirantGallery');
+            if (!galleryContainer) return;
+
+            if (galleryImages.length === 0) {
+                galleryContainer.innerHTML = '<p class="col-span-full text-gray-500 italic p-4 text-center">Check back soon for our team memories!</p>';
+                return;
+            }
+
+            galleryContainer.innerHTML = galleryImages.map(url => `
+                <div class="aspect-video overflow-hidden rounded-xl shadow-lg hover:shadow-xl transition duration-300 transform hover:scale-[1.02] cursor-pointer">
+                    <img src="${url}" 
+                         alt="Marshall & The Gypsies Team Memory" 
+                         onerror="this.onerror=null;this.src='https://placehold.co/600x400/3c2a6d/ffffff?text=Image+Unavailable'"
+                         class="w-full h-full object-cover">
+                </div>
+            `).join('');
+        }
+        
+        function renderMarshallGalleryManagement() {
+            const managerContainer = document.getElementById('marshallGalleryManagementList');
+            if (!managerContainer) return;
+
+            if (galleryImages.length === 0) {
+                managerContainer.innerHTML = '<p class="text-gray-500 italic">No images currently in the gallery.</p>';
+                return;
+            }
+
+            managerContainer.innerHTML = galleryImages.map(url => `
+                <div class="flex items-center justify-between p-2 bg-gray-700 rounded-lg mb-2">
+                    <span class="text-xs text-gray-300 truncate">${url}</span>
+                    <button onclick="window.removeGalleryImage('${url}')" class="flex-shrink-0 ml-2 px-2 py-1 text-xs font-semibold rounded-lg bg-red-600 text-white hover:bg-red-700 transition">
+                        Remove
+                    </button>
+                </div>
+            `).join('');
+        }
+
+        function renderMarshallDatabase(applications) {
+            const container = document.getElementById('applicationsList');
+            if (!container) return;
+
+            // Client-side check for Marshall's view
+            if (userId !== marshallUid) {
+                 container.innerHTML = '<p class="text-gray-500 italic p-4 text-center">Access restricted to Marshall.</p>';
+                 return;
+            }
+
+            if (applications.length === 0) {
+                container.innerHTML = '<p class="text-gray-500 italic p-4 text-center">No pending applications.</p>';
+                return;
+            }
+
+            container.innerHTML = applications.map(app => `
+                <div class="border border-gray-200 p-4 rounded-lg mb-4 shadow-sm bg-white">
+                    <h3 class="text-lg font-bold text-purple-700">${app.name}</h3>
+                    <p class="text-sm text-gray-800">Applying for: <span class="font-semibold">${app.role}</span> (${app.experience} months+)</p>
+                    <p class="text-sm text-gray-600">Occupation: ${app.occupation}</p>
+                    <p class="text-xs text-gray-500 mt-1">Location: ${app.location.houseNumber}, ${app.location.street}, ${app.location.city}, ${app.location.state}, ${app.location.country}</p>
+                    <div class="mt-3 space-x-2">
+                        <button onclick="window.acceptApplication('${app.id}', '${app.role}')" class="px-3 py-1 text-xs font-semibold rounded-lg bg-green-500 text-white hover:bg-green-600 transition">
+                            Accept & Clear
+                        </button>
+                        <button onclick="window.deleteApplication('${app.id}', '${app.role}')" class="px-3 py-1 text-xs font-semibold rounded-lg bg-red-500 text-white hover:bg-red-600 transition">
+                            Delete
+                        </button>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+    </script>
+</head>
+<body class="min-h-screen bg-gray-100 p-4 sm:p-8">
+    
+    <!-- Main Header -->
+    <header class="text-center mb-8 bg-white p-6 rounded-xl shadow-lg border-b-4 border-purple-600">
+        <div class="flex items-center justify-center space-x-4 mb-2">
+            <!-- Consolidated Logo Area: Visible placeholder used -->
+            <img src="https://placehold.co/100x100/1e0a3f/ffffff?text=M+%26+G" 
+                 alt="Marshall & The Gypsies Logo" 
+                 class="w-20 h-20 rounded-full object-contain">
+            
+            <h1 class="text-4xl font-extrabold text-gray-900 leading-tight">
+                MARSHALL & THE GYPSIES ENTERTAINMENT
+            </h1>
+            
+        </div>
+        <h2 class="text-xl text-purple-600 font-semibold mt-1">
+            Host of Gypsy Night and Weekend in Port Harcourt
+        </h2>
+        <p class="text-sm text-gray-500 mt-2 italic">
+            In partnership with the event: <span class="font-bold text-gray-700">Kiss With Rekii</span>
+        </p>
+        <p id="currentUserUID" class="text-xs text-gray-400 mt-2">Loading user status...</p>
+    </header>
+
+    <!-- Main Content Grid -->
+    <main class="max-w-4xl mx-auto">
+        
+        <!-- Intro Section -->
+        <section class="mb-8 p-6 bg-purple-50 rounded-xl shadow-md border-l-4 border-purple-600">
+            <h3 class="text-2xl font-bold text-purple-800 mb-2">Gypsy Night: The Ultimate Nightlife Experience</h3>
+            <p class="text-gray-700">
+                Welcome to the official recruitment portal. If you are committed to **loyalty, availability, and accountability**, we encourage you to apply below.
+            </p>
+        </section>
+
+        <!-- Our Memories Gallery Section -->
+        <section class="mb-10 p-6 bg-white rounded-xl shadow-lg">
+            <h3 class="text-2xl font-bold text-gray-800 mb-6 border-b pb-3 text-center">
+                ✨ Our Team Memories
+            </h3>
+            <div id="aspirantGallery" class="grid grid-cols-2 md:grid-cols-3 gap-4">
+                <p class="col-span-full text-gray-500 italic p-4 text-center">Loading team memories...</p>
+            </div>
+        </section>
+
+        <!-- Recruitment Form -->
+        <section class="bg-white p-6 rounded-xl shadow-lg mb-8">
+            <h3 class="text-2xl font-bold text-gray-800 mb-6 border-b pb-3">Team Application Form</h3>
+            <form id="recruitmentForm" class="space-y-6">
+                
+                <!-- Experience Level -->
+                <div>
+                    <label for="experience" class="block text-sm font-medium text-gray-700 mb-1">Team Tenure (Experience)</label>
+                    <select id="experience" name="experience" required class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-lg shadow-sm focus:ring-purple-500 focus:border-purple-500 transition duration-150">
+                        <option value="">-- Select Duration --</option>
+                        <option value="0-1">0 - 1 Month (New Member)</option>
+                        <option value="2+">2 Months and Above (Experienced/Returning)</option>
+                    </select>
+                </div>
+
+                <!-- Role Selection Container (Dynamically updated by JS) -->
+                <div id="roleContainer">
+                    <p class="text-sm text-gray-500">Select your tenure above to view available roles.</p>
+                </div>
+                
+                <!-- Personal Details -->
+                <h4 class="text-lg font-semibold text-gray-700 pt-4 border-t">Personal Information</h4>
+
+                <div>
+                    <label for="name" class="block text-sm font-medium text-gray-700 mb-1">Full Name</label>
+                    <input type="text" id="name" name="name" required placeholder="Your full legal name" class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-lg shadow-sm">
+                </div>
+                
+                <div>
+                    <label for="occupation" class="block text-sm font-medium text-gray-700 mb-1">Current Occupation / Field of Study</label>
+                    <input type="text" id="occupation" name="occupation" required placeholder="E.g., Student, Marketing Specialist" class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-lg shadow-sm">
+                </div>
+                
+                <!-- Location Details -->
+                <h4 class="text-lg font-semibold text-gray-700 pt-4 border-t">Exact Location</h4>
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div>
+                        <label for="houseNumber" class="block text-sm font-medium text-gray-700 mb-1">House/Apt Number</label>
+                        <input type="text" id="houseNumber" name="houseNumber" required class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-lg shadow-sm">
+                    </div>
+                    <div>
+                        <label for="street" class="block text-sm font-medium text-gray-700 mb-1">Street Name</label>
+                        <input type="text" id="street" name="street" required class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-lg shadow-sm">
+                    </div>
+                    <div>
+                        <label for="city" class="block text-sm font-medium text-gray-700 mb-1">City</label>
+                        <input type="text" id="city" name="city" required class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-lg shadow-sm">
+                    </div>
+                    <div>
+                        <label for="state" class="block text-sm font-medium text-gray-700 mb-1">State / Province</label>
+                        <input type="text" id="state" name="state" required class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-lg shadow-sm">
+                    </div>
+                    <div class="md:col-span-2">
+                        <label for="country" class="block text-sm font-medium text-gray-700 mb-1">Country</label>
+                        <input type="text" id="country" name="country" required class="mt-1 block w-full px-3 py-2 border border-gray-300 rounded-lg shadow-sm">
+                    </div>
+                </div>
+
+                <!-- Commitment Agreement -->
+                <div class="pt-4">
+                    <div class="flex items-start">
+                        <input id="commitment" name="commitment" type="checkbox" required class="h-4 w-4 text-purple-600 border-gray-300 rounded focus:ring-purple-500">
+                        <label for="commitment" class="ml-3 text-sm text-gray-700">
+                            I agree to the commitment of **loyalty, availability, and accountability** to the entertainment team, to respect the hierarchy, and to be fully involved in all team operations.
+                        </label>
+                    </div>
+                </div>
+                
+                <!-- Message Box -->
+                <div id="messageBox" class="mt-4 p-4 rounded-lg text-sm hidden"></div>
+
+                <button type="submit"
+                        class="w-full flex justify-center py-3 px-4 border border-transparent rounded-xl shadow-md text-base font-bold text-white bg-purple-600 hover:bg-purple-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-purple-500 transition duration-150 ease-in-out transform hover:scale-[1.005]">
+                    Submit Application
+                </button>
+            </form>
+        </section>
+        
+        <!-- Marshall's Exclusive Database View -->
+        <section id="marshallView" class="hidden mt-10 p-6 bg-gray-900 rounded-xl shadow-2xl border-t-4 border-yellow-400">
+            <h3 class="text-2xl font-bold text-yellow-400 mb-4">
+                👑 MARSHALL'S EXCLUSIVE DATABASE VIEW
+            </h3>
+            <p class="text-sm text-gray-400 mb-4">
+                This section is visible only to the owner (Marshall). All actions are protected by Firebase security rules.
+            </p>
+
+            <!-- Gallery Management Section -->
+            <div class="mb-8">
+                <h4 class="text-xl font-semibold text-yellow-400 mb-3 border-b border-gray-700 pb-2">🖼️ Gallery Management (Add Direct Image URLs)</h4>
+                <div class="flex space-x-2 mb-4">
+                    <input type="url" id="newImageUrl" placeholder="Paste direct image URL" class="flex-grow p-2 rounded-lg text-gray-900 focus:ring-purple-500 focus:border-purple-500">
+                    <button id="addImageUrlButton" class="flex-shrink-0 px-4 py-2 text-sm font-bold rounded-lg bg-purple-600 text-white hover:bg-purple-700 transition">
+                        Add Image
+                    </button>
+                </div>
+                <div id="marshallGalleryManagementList" class="max-h-64 overflow-y-auto">
+                    <p class="text-gray-500 italic">Loading gallery links...</p>
+                </div>
+            </div>
+            
+            <!-- Pending Applications Section -->
+            <h4 class="text-xl font-semibold text-white mb-3 border-b border-gray-700 pb-2">📂 Pending Applications</h4>
+            <div id="applicationsList">
+                <p class="text-gray-500 italic p-4 text-center">Loading applications...</p>
+            </div>
+        </section>
+
+    </main>
+
+    <!-- Custom Confirmation Modal -->
+    <div id="customModal" class="hidden fixed inset-0 bg-gray-600 bg-opacity-75 flex items-center justify-center z-50 p-4">
+        <div class="bg-white p-6 rounded-xl shadow-2xl max-w-sm w-full">
+            <h3 id="modalTitle" class="text-xl font-bold text-gray-800 mb-4">Confirm Action</h3>
+            <p id="modalMessage" class="text-gray-600 mb-6"></p>
+            <div class="flex justify-end space-x-3">
+                <button id="modalCancel" class="px-4 py-2 text-sm font-semibold rounded-lg bg-gray-200 text-gray-800 hover:bg-gray-300 transition">
+                    Cancel
+                </button>
+                <button id="modalConfirm" class="px-4 py-2 text-sm font-semibold rounded-lg bg-red-600 text-white hover:bg-red-700 transition">
+                    Confirm
+                </button>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
